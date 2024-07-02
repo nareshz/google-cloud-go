@@ -63,6 +63,10 @@ const (
 
 	requestsCompressionHeader = "x-response-encoding"
 
+	// endToEndTracingHeader is the name of the metadata header if client
+	// has opted-in for the creation of trace spans on the Spanner layer.
+	endToEndTracingHeader = "x-goog-spanner-end-to-end-tracing"
+
 	// numChannels is the default value for NumChannels of client.
 	numChannels = 4
 )
@@ -331,6 +335,12 @@ type ClientConfig struct {
 	DirectedReadOptions *sppb.DirectedReadOptions
 
 	OpenTelemetryMeterProvider metric.MeterProvider
+
+	// EnableEndToEndTracing indicates whether end to end tracing is enabled or not.
+	// If it is enabled, trace spans will be created at Spanner layer.
+	//
+	// Default: false
+	EnableEndToEndTracing bool
 }
 
 type openTelemetryConfig struct {
@@ -443,6 +453,9 @@ func newClientWithConfig(ctx context.Context, database string, config ClientConf
 	md := metadata.Pairs(resourcePrefixHeader, database)
 	if config.Compression == gzip.Name {
 		md.Append(requestsCompressionHeader, gzip.Name)
+	}
+	if config.EnableEndToEndTracing {
+		md.Append(endToEndTracingHeader, "true")
 	}
 
 	// Create a session client.
@@ -609,6 +622,7 @@ func (c *Client) Single() *ReadOnlyTransaction {
 	}
 	t.txReadOnly.qo.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
+	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t
@@ -635,6 +649,7 @@ func (c *Client) ReadOnlyTransaction() *ReadOnlyTransaction {
 	t.txReadOnly.disableRouteToLeader = true
 	t.txReadOnly.qo.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
+	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t
@@ -706,6 +721,7 @@ func (c *Client) BatchReadOnlyTransaction(ctx context.Context, tb TimestampBound
 	t.txReadOnly.disableRouteToLeader = true
 	t.txReadOnly.qo.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
+	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t, nil
@@ -740,6 +756,7 @@ func (c *Client) BatchReadOnlyTransactionFromID(tid BatchReadOnlyTransactionID) 
 	t.txReadOnly.disableRouteToLeader = true
 	t.txReadOnly.qo.DirectedReadOptions = c.dro
 	t.txReadOnly.ro.DirectedReadOptions = c.dro
+	t.txReadOnly.ro.LockHint = sppb.ReadRequest_LOCK_HINT_UNSPECIFIED
 	t.ct = c.ct
 	t.otConfig = c.otConfig
 	return t

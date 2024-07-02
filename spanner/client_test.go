@@ -877,6 +877,9 @@ func checkReqsForReadOptions(t *testing.T, server InMemSpannerServer, ro ReadOpt
 	if got, want := sqlReq.OrderBy, ro.OrderBy; got != want {
 		t.Fatalf("OrderBy mismatch, got %v, want %v", got, want)
 	}
+	if got, want := sqlReq.LockHint, ro.LockHint; got != want {
+		t.Fatalf("LockHint mismatch, got %v, want %v", got, want)
+	}
 }
 
 func checkReqsForTransactionOptions(t *testing.T, server InMemSpannerServer, txo TransactionOptions) {
@@ -2143,6 +2146,89 @@ func TestClient_ReadWriteTransaction_Query_QueryOptions(t *testing.T) {
 	}
 }
 
+func TestClient_ReadWriteTransaction_LockHintOptions(t *testing.T) {
+	readOptionsTestCases := []ReadOptionsTestCase{
+		{
+			name:   "Client level",
+			client: &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+			want:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+		},
+		{
+			name:   "Read level",
+			client: &ReadOptions{},
+			read:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+			want:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+		},
+		{
+			name:   "Read level has precedence than client level",
+			client: &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_SHARED},
+			read:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+			want:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+		},
+		{
+			name:   "Client level has precendence when LOCK_HINT_UNSPECIFIED at read level",
+			client: &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+			read:   &ReadOptions{},
+			want:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+		},
+	}
+
+	for _, tt := range readOptionsTestCases {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			server, client, teardown := setupMockedTestServerWithConfig(t, ClientConfig{ReadOptions: *tt.client})
+			defer teardown()
+
+			_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) error {
+				var iter *RowIterator
+				if tt.read == nil {
+					iter = tx.Read(ctx, "Albums", KeySets(Key{"foo"}), []string{"SingerId", "AlbumId", "AlbumTitle"})
+				} else {
+					iter = tx.ReadWithOptions(ctx, "Albums", KeySets(Key{"foo"}), []string{"SingerId", "AlbumId", "AlbumTitle"}, tt.read)
+				}
+				testReadOptions(t, iter, server.TestSpanner, *tt.want)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestClient_ReadOnlyTransaction_LockHintOptions(t *testing.T) {
+	readOptionsTestCases := []ReadOptionsTestCase{
+		{
+			name:   "Client level Lock hint overiden in request level",
+			client: &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+			read:   &ReadOptions{},
+			want:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_UNSPECIFIED},
+		},
+		{
+			name:   "Request level",
+			client: &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_EXCLUSIVE},
+			read:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_SHARED},
+			want:   &ReadOptions{LockHint: sppb.ReadRequest_LOCK_HINT_SHARED},
+		},
+	}
+
+	for _, tt := range readOptionsTestCases {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			server, client, teardown := setupMockedTestServerWithConfig(t, ClientConfig{ReadOptions: *tt.client})
+			defer teardown()
+
+			for _, tx := range []*ReadOnlyTransaction{
+				client.Single(),
+				client.ReadOnlyTransaction(),
+			} {
+				iter := tx.ReadWithOptions(ctx, "Albums", KeySets(Key{"foo"}), []string{"SingerId", "AlbumId", "AlbumTitle"}, tt.read)
+				testReadOptions(t, iter, server.TestSpanner, *tt.want)
+			}
+
+		})
+	}
+}
 func TestClient_ReadWriteTransaction_Query_ReadOptions(t *testing.T) {
 	for _, tt := range readOptionsTestCases() {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3474,6 +3560,21 @@ func TestReadWriteTransaction_WrapSessionNotFoundError(t *testing.T) {
 	}
 }
 
+func TestStmtBasedReadWriteTransaction_SessionNotFoundError_shouldNotPanic(t *testing.T) {
+	t.Parallel()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+	server.TestSpanner.PutExecutionTime(MethodBeginTransaction,
+		SimulatedExecutionTime{
+			Errors: []error{newSessionNotFoundError("projects/p/instances/i/databases/d/sessions/s")},
+		})
+	ctx := context.Background()
+	tx, _ := NewReadWriteStmtBasedTransaction(ctx, client)
+	_ = tx.BufferWrite([]*Mutation{Update("my_table", []string{"key", "value"}, []interface{}{int64(1), "my-value"})})
+	// This would panic, as it could not refresh the session.
+	_, _ = tx.Commit(ctx)
+}
+
 func TestClient_WriteStructWithPointers(t *testing.T) {
 	t.Parallel()
 	server, client, teardown := setupMockedTestServer(t)
@@ -3955,6 +4056,52 @@ func TestClient_WithGRPCConnectionPoolAndNumChannels_Misconfigured(t *testing.T)
 	}
 	if !strings.Contains(se.Error(), msg) {
 		t.Fatalf("Error message mismatch\nGot: %s\nWant: %s", se.Error(), msg)
+	}
+}
+
+func TestClient_WithEndToEndTracingHeader(t *testing.T) {
+	t.Parallel()
+
+	server, opts, serverTeardown := NewMockedSpannerInMemTestServer(t)
+	defer serverTeardown()
+
+	wantEndToEndTracing := true
+	config := ClientConfig{EnableEndToEndTracing: wantEndToEndTracing}
+	client, err := makeClientWithConfig(context.Background(), "projects/p/instances/i/databases/d", config, server.ServerAddress, opts...)
+	if err != nil {
+		t.Fatalf("failed to get a client: %v", err)
+	}
+	gotEndToEndTracing := false
+	for _, val := range client.sc.md.Get(endToEndTracingHeader) {
+		if val == "true" {
+			gotEndToEndTracing = true
+		}
+	}
+	if gotEndToEndTracing != wantEndToEndTracing {
+		t.Fatalf("mismatch in client configuration for property EnableEndToEndTracing: got %v, want %v", gotEndToEndTracing, wantEndToEndTracing)
+	}
+}
+
+func TestClient_WithoutEndToEndTracingHeader(t *testing.T) {
+	t.Parallel()
+
+	server, opts, serverTeardown := NewMockedSpannerInMemTestServer(t)
+	defer serverTeardown()
+
+	wantEndToEndTracing := false
+	config := ClientConfig{EnableEndToEndTracing: wantEndToEndTracing}
+	client, err := makeClientWithConfig(context.Background(), "projects/p/instances/i/databases/d", config, server.ServerAddress, opts...)
+	if err != nil {
+		t.Fatalf("failed to get a client: %v", err)
+	}
+	gotEndToEndTracing := false
+	for _, val := range client.sc.md.Get(endToEndTracingHeader) {
+		if val == "true" {
+			gotEndToEndTracing = true
+		}
+	}
+	if gotEndToEndTracing != wantEndToEndTracing {
+		t.Fatalf("mismatch in client configuration for property EnableEndToEndTracing: got %v, want %v", gotEndToEndTracing, wantEndToEndTracing)
 	}
 }
 
