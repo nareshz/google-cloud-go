@@ -28,6 +28,7 @@ import (
 	"cloud.google.com/go/spanner/executor/apiv1/executorpb"
 	"cloud.google.com/go/spanner/test/cloudexecutor/executor/actions"
 	"cloud.google.com/go/spanner/test/cloudexecutor/executor/internal/outputstream"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -114,6 +115,13 @@ func (h *CloudStreamHandler) startHandlingRequest(ctx context.Context, req *exec
 	if err != nil {
 		return outcomeSender.FinishWithError(err)
 	}
+	actionHandlerType := actionHandlerType(inputAction)
+
+	tracer := otel.Tracer("nareshz-systest.com/trace")
+
+	// Create a span for the systest action.
+	ctx, span := tracer.Start(ctx, fmt.Sprintf("systestaction_%v", actionHandlerType))
+	defer span.End()
 
 	// Create a channel to receive the error from the goroutine.
 	errCh := make(chan error, 1)
@@ -139,6 +147,44 @@ func (h *CloudStreamHandler) startHandlingRequest(ctx context.Context, req *exec
 		// Success signal received.
 		log.Println("Action executed successfully")
 		return nil
+	}
+}
+
+// newActionHandler instantiates an actionHandler for executing the given action.
+func actionHandlerType(action *executorpb.SpannerAction) string {
+	switch action.GetAction().(type) {
+	case *executorpb.SpannerAction_Start:
+		return "SpannerAction_Start"
+	case *executorpb.SpannerAction_Finish:
+		return "SpannerAction_Finish"
+	case *executorpb.SpannerAction_Admin:
+		return "SpannerAction_Admin"
+	case *executorpb.SpannerAction_Read:
+		return "SpannerAction_Read"
+	case *executorpb.SpannerAction_Query:
+		return "SpannerAction_Query"
+	case *executorpb.SpannerAction_Mutation:
+		return "SpannerAction_Mutation"
+	case *executorpb.SpannerAction_Write:
+		return "SpannerAction_Write"
+	case *executorpb.SpannerAction_Dml:
+		return "SpannerAction_Dml"
+	case *executorpb.SpannerAction_StartBatchTxn:
+		return "SpannerAction_StartBatchTxn"
+	case *executorpb.SpannerAction_GenerateDbPartitionsRead:
+		return "SpannerAction_GenerateDbPartitionsRead"
+	case *executorpb.SpannerAction_GenerateDbPartitionsQuery:
+		return "SpannerAction_GenerateDbPartitionsQuery"
+	case *executorpb.SpannerAction_ExecutePartition:
+		return "SpannerAction_ExecutePartition"
+	case *executorpb.SpannerAction_PartitionedUpdate:
+		return "SpannerAction_PartitionedUpdate"
+	case *executorpb.SpannerAction_CloseBatchTxn:
+		return "SpannerAction_CloseBatchTxn"
+	case *executorpb.SpannerAction_BatchDml:
+		return "SpannerAction_BatchDml"
+	default:
+		return "SpannerAction_default"
 	}
 }
 
